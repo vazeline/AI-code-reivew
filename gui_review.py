@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""
+Простое оконное приложение для локального код-ревью (обёртка над agent_system.py).
+
+Поля:
+  - Папка проекта (git-репозиторий);
+  - Многострочное описание того, что сделано в изменениях;
+  - Модель LM Studio (по умолчанию автоопределение).
+
+Кнопка "Запуск" стартует ревью, лог пишется прямо в окно.
+После завершения отчёт автоматически открывается в Notepad++.
+
+Запуск без консольного окна:
+    pythonw gui_review.py
+"""
+
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from datetime import datetime
+from pathlib import Path
+from urllib.request import urlopen
+import json
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+AGENT = SCRIPT_DIR / "agent_system.py"
+LM_STUDIO_BASE = os.environ.get("LM_STUDIO_URL", "http://localhost:1234/v1")
+
+AUTO_MODEL_LABEL = "(автоопределение)"
+
+
+def find_notepadpp():
+    candidates = [
+        r"C:\Program Files\Notepad++\notepad++.exe",
+        r"C:\Program Files (x86)\Notepad++\notepad++.exe",
+        r"C:\Program Files\Notepad++\notepad++.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return shutil.which("notepad++.exe") or shutil.which("notepad++")
+
+
+class ReviewApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Локальное код-ревью (LM Studio)")
+        self.geometry("820x660")
+        self.minsize(640, 520)
+
+        self.proc = None
+        self.out_path = None
+        self.desc_file = None
+        self.q = queue.Queue()
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        threading.Thread(target=self._fetch_models, daemon=True).start()
+
+    def _build_ui(self):
+        root = ttk.Frame(self, padding=12)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(3, weight=1)
+        root.rowconfigure(5, weight=2)
+
+        ttk.Label(root, text="Папка проекта (git-репозиторий):").grid(
+            row=0, column=0, sticky="w")
+        folder_row = ttk.Frame(root)
+        folder_row.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        folder_row.columnconfigure(0, weight=1)
+        self.folder_var = tk.StringVar()
+        ttk.Entry(folder_row, textvariable=self.folder_var).grid(
+            row=0, column=0, sticky="ew")
+        ttk.Button(folder_row, text="Обзор…", command=self._browse).grid(
+            row=0, column=1, padx=(6, 0))
+
+        ttk.Label(root, text="Что сделано в этих изменениях (описание):").grid(
+            row=2, column=0, sticky="nw")
+        self.desc_text = tk.Text(root, height=6, wrap="word", undo=True)
+        self.desc_text.grid(row=3, column=0, sticky="nsew", pady=(2, 8))
+
+        opts = ttk.Frame(root)
+        opts.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        opts.columnconfigure(1, weight=1)
+        ttk.Label(opts, text="Модель:").grid(row=0, column=0, sticky="w")
+        self.model_var = tk.StringVar(value=AUTO_MODEL_LABEL)
+        self.model_combo = ttk.Combobox(
+            opts, textvariable=self.model_var, values=[AUTO_MODEL_LABEL])
+        self.model_combo.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+        self.open_npp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Открыть отчёт в Notepad++ по завершении",
+                        variable=self.open_npp_var).grid(row=0, column=2, sticky="e")
+
+        btns = ttk.Frame(root)
+        btns.grid(row=5, column=0, sticky="new")
+        self.run_btn = ttk.Button(btns, text="Запуск", command=self._run)
+        self.run_btn.pack(side="left")
+        self.stop_btn = ttk.Button(btns, text="Стоп", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.status_var = tk.StringVar(value="Готово к запуску")
+        ttk.Label(btns, textvariable=self.status_var).pack(side="left", padx=(12, 0))
+
+        log_frame = ttk.LabelFrame(root, text="Журнал", padding=4)
+        log_frame.grid(row=5, column=0, sticky="nsew", pady=(40, 0))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log = tk.Text(log_frame, state="disabled", wrap="word", height=10)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(log_frame, command=self.log.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=sb.set)
+
+        ttk.Label(root, text="Совет: запускайте через pythonw gui_review.py, чтобы не было консоли.",
+                  foreground="#777").grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+    def _browse(self):
+        initial = self.folder_var.get() or str(Path.home())
+        chosen = filedialog.askdirectory(initialdir=initial, title="Выберите папку проекта")
+        if chosen:
+            self.folder_var.set(os.path.normpath(chosen))
+
+    def _fetch_models(self):
+        try:
+            with urlopen(LM_STUDIO_BASE + "/models", timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            models = [m.get("id", "") for m in data.get("data", [])]
+            models = [m for m in models if m and "embed" not in m.lower()]
+        except Exception:
+            models = []
+        self.after(0, lambda: self._set_models(models))
+
+    def _set_models(self, models):
+        values = [AUTO_MODEL_LABEL] + models
+        self.model_combo.configure(values=values)
+        if self.model_var.get() not in values:
+            self.model_var.set(AUTO_MODEL_LABEL)
+
+    def _append(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _set_running(self, running):
+        self.run_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+
+    def _run(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        folder = self.folder_var.get().strip().strip('"')
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Ошибка", "Укажите существующую папку проекта.")
+            return
+        if not AGENT.is_file():
+            messagebox.showerror("Ошибка", f"Не найден {AGENT}")
+            return
+
+        description = self.desc_text.get("1.0", "end").strip()
+        self.desc_file = None
+        if description:
+            fd, self.desc_file = tempfile.mkstemp(suffix=".txt", prefix="review_desc_")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(description)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.out_path = SCRIPT_DIR / f"code_review_{stamp}.md"
+
+        cmd = [sys.executable, str(AGENT), folder, "--out", str(self.out_path)]
+        model = self.model_var.get().strip()
+        if model and model != AUTO_MODEL_LABEL:
+            cmd += ["--model", model]
+        if self.desc_file:
+            cmd += ["--description-file", self.desc_file]
+
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self._append(f"[GUI] Запуск: {' '.join(cmd)}")
+        self.status_var.set("Выполняется…")
+
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            cwd=str(SCRIPT_DIR), creationflags=creationflags)
+
+        self._set_running(True)
+        threading.Thread(target=self._reader, daemon=True).start()
+        self.after(100, self._pump)
+
+    def _reader(self):
+        try:
+            for line in self.proc.stdout:
+                self.q.put(("log", line.rstrip("\n")))
+        finally:
+            try:
+                code = self.proc.wait()
+            except Exception:
+                code = -1
+            self.q.put(("done", code))
+
+    def _pump(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "log":
+                    self._append(payload)
+                elif kind == "done":
+                    self._finish(payload)
+                    return
+        except queue.Empty:
+            pass
+        if self.proc is not None and self.proc.poll() is None:
+            self.after(100, self._pump)
+
+    def _finish(self, code):
+        self._set_running(False)
+        if self.desc_file and os.path.isfile(self.desc_file):
+            try:
+                os.remove(self.desc_file)
+            except OSError:
+                pass
+            self.desc_file = None
+
+        if code == 0 and self.out_path and self.out_path.is_file():
+            self.status_var.set(f"Готово: {self.out_path.name}")
+            self._append(f"[GUI] Отчёт готов: {self.out_path}")
+            if self.open_npp_var.get():
+                where = self._open_in_editor(self.out_path)
+                self._append(f"[GUI] Отчёт открыт: {where}")
+        elif code == 0:
+            self.status_var.set("Готово (изменений не найдено)")
+            self._append("[GUI] Изменений не найдено — отчёт не создан.")
+        else:
+            self.status_var.set(f"Ошибка (код {code})")
+            self._append(f"[GUI] Процесс завершился с кодом {code}.")
+        self.proc = None
+
+    def _open_in_editor(self, path):
+        npp = find_notepadpp()
+        try:
+            if npp:
+                subprocess.Popen([npp, str(path)])
+                return "Notepad++"
+            if os.name == "nt":
+                os.startfile(str(path))
+                return "программе по умолчанию"
+            subprocess.Popen(["xdg-open", str(path)])
+            return "xdg-open"
+        except Exception as e:
+            return f"не удалось открыть ({e})"
+
+    def _stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self._append("[GUI] Остановка процесса…")
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+    def _on_close(self):
+        if self.proc is not None and self.proc.poll() is None:
+            if not messagebox.askyesno("Выход", "Ревью ещё выполняется. Прервать и выйти?"):
+                return
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        if self.desc_file and os.path.isfile(self.desc_file):
+            try:
+                os.remove(self.desc_file)
+            except OSError:
+                pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    ReviewApp().mainloop()

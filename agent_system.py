@@ -427,14 +427,23 @@ def ground_findings(findings, new_text, old_text, diff_text):
     return accepted, rejected
 
 
-def build_user_prompt(target, repo_map, related, max_chars):
+def build_user_prompt(target, repo_map, related, max_chars, description=""):
     parts = [
         f"ФАЙЛ: {target['path']} (статус {target['status']}, язык "
         f"{LANG_BY_EXT.get(Path(target['path']).suffix.lower(), '?')})",
         "",
         "КАРТА РЕПОЗИТОРИЯ (структура всего проекта):",
         repo_map,
+    ]
+    if description.strip():
+        parts += [
+            "",
+            "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):",
+            description.strip(),
+        ]
+    parts += [
         "",
+        "GIT DIFF:",
         "GIT DIFF:",
         target["diff"] or "(нет текстового diff, новый файл)",
         "",
@@ -474,8 +483,8 @@ def build_user_prompt(target, repo_map, related, max_chars):
     return text
 
 
-def review_file(target, repo_map, related, model, max_chars, retries=2):
-    user = build_user_prompt(target, repo_map, related, max_chars)
+def review_file(target, repo_map, related, model, max_chars, retries=2, description=""):
+    user = build_user_prompt(target, repo_map, related, max_chars, description)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
@@ -513,6 +522,11 @@ def write_report(path, data):
     lines.append(f"- Модель: `{data['model']}`")
     lines.append(f"- Дата: {data['timestamp']}")
     lines.append(f"- Длительность: {data['duration']:.1f} с")
+    if data.get("description"):
+        desc = data["description"].strip().replace("\n", " ")
+        if len(desc) > 400:
+            desc = desc[:400] + "..."
+        lines.append(f"- Описание изменений: {desc}")
     lines.append(f"- Проверено файлов: {data['files_reviewed']} из {data['files_total']}")
     lines.append(f"- Замечаний подтверждено: {data['accepted_count']} | "
                  f"отклонено grounding-валидатором: {data['rejected_count']}")
@@ -579,6 +593,8 @@ def main():
                     help="бюджет контекста на один файл (символы)")
     ap.add_argument("--max-tokens", type=int, default=1800, help="максимум токенов ответа")
     ap.add_argument("--out", help="путь к файлу отчёта (по умолчанию рядом со скриптом)")
+    ap.add_argument("--description", help="текстовое описание того, что сделано в изменениях")
+    ap.add_argument("--description-file", help="файл с описанием изменений (UTF-8)")
     ap.add_argument("--no-llm", action="store_true", help="только git+контекст, без модели")
     ap.add_argument("--list", action="store_true", help="показать изменённые файлы и выйти")
     args = ap.parse_args()
@@ -620,6 +636,15 @@ def main():
     mech = mechanical_checks(repo, diff_args if diff_args != ["HEAD~1...HEAD"] else ["HEAD~1", "HEAD"])
     cache = {}
 
+    description = ""
+    if args.description_file:
+        try:
+            description = Path(args.description_file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"[Предупреждение] Не удалось прочитать описание из файла: {e}")
+    if args.description:
+        description = args.description
+
     by_file = {}
     rejected = []
     errors = []
@@ -635,7 +660,8 @@ def main():
             print(f"    diff={len(t['diff'])} симв., связанных файлов={len(related)}")
             continue
         findings, usage, err = review_file(t, repo_map, related, model,
-                                           args.max_context_chars)
+                                           args.max_context_chars,
+                                           description=description)
         for k in tokens_total:
             tokens_total[k] += int(usage.get(k, 0) or 0)
         if err:
@@ -662,6 +688,7 @@ def main():
     write_report(out_path, {
         "repo": repo, "mode": mode, "model": model,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "description": description,
         "duration": duration,
         "files_reviewed": len(by_file), "files_total": len(targets),
         "accepted_count": sum(len(v) for v in by_file.values()),
