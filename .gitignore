@@ -1,0 +1,6 @@
+# Отчёты код-ревью
+reviews/
+
+# Python
+__pycache__/
+*.pyc

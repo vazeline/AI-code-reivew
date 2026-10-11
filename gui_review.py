@@ -97,6 +97,10 @@ class ReviewApp(tk.Tk):
         self.open_npp_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Открыть отчёт в Notepad++ по завершении",
                         variable=self.open_npp_var).grid(row=0, column=2, sticky="e")
+        self.batch_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Все файлы одним промптом (batch)",
+                        variable=self.batch_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         btns = ttk.Frame(root)
         btns.grid(row=5, column=0, sticky="new")
@@ -171,7 +175,9 @@ class ReviewApp(tk.Tk):
                 f.write(description)
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.out_path = SCRIPT_DIR / f"code_review_{stamp}.md"
+        reviews_dir = SCRIPT_DIR / "reviews"
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+        self.out_path = reviews_dir / f"code_review_{stamp}.md"
 
         cmd = [sys.executable, str(AGENT), folder, "--out", str(self.out_path)]
         model = self.model_var.get().strip()
@@ -179,6 +185,8 @@ class ReviewApp(tk.Tk):
             cmd += ["--model", model]
         if self.desc_file:
             cmd += ["--description-file", self.desc_file]
+        if self.batch_var.get():
+            cmd += ["--batch"]
 
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")

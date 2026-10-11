@@ -13,7 +13,8 @@
      с замечаниями.
   4. Механически валидирует ответ: JSON-схема + привязка строк и фрагментов
      к реальному коду (grounding). Непривязанные "галлюцинации" отбрасываются.
-  5. Пишет Markdown-отчёт рядом с этим скриптом.
+  5. Пишет Markdown-отчёт в подпапку reviews/ (добавлена в .gitignore).
+     Флаг --batch проверяет все изменённые файлы одним промптом.
 
 Примеры:
     python agent_system.py "C:\\path\\to\\repo"
@@ -427,6 +428,114 @@ def ground_findings(findings, new_text, old_text, diff_text):
     return accepted, rejected
 
 
+def norm_path(p: str) -> str:
+    p = (p or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def ground_batch(findings, targets_by_path):
+    lookup = {norm_path(k): v for k, v in targets_by_path.items()}
+    accepted, rejected = [], []
+    for f in findings:
+        if not isinstance(f, dict):
+            rejected.append({"file": "?", "finding": f, "reason": "не объект"})
+            continue
+        fpath = norm_path(str(f.get("file", "")))
+        target = lookup.get(fpath)
+        if not fpath or target is None:
+            f["file"] = fpath or "?"
+            rejected.append({"file": f["file"], "finding": f,
+                             "reason": f"файл '{fpath}' не в списке изменённых"})
+            continue
+        f["file"] = next((k for k in targets_by_path if norm_path(k) == fpath), fpath)
+        a, r = ground_findings([f], target["new_text"], target["old_text"], target["diff"])
+        accepted.extend(a)
+        for rr in r:
+            rejected.append({"file": f["file"], **rr})
+    return accepted, rejected
+
+
+def review_batch(targets, repo_map, model, max_chars, description="", retries=2):
+    base = [
+        "КАРТА РЕПОЗИТОРИЯ (структура всего проекта):",
+        repo_map,
+    ]
+    if description.strip():
+        base += ["", "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):", description.strip()]
+    base = "\n".join(base) + "\n\nИЗМЕНЁННЫЕ ФАЙЛЫ ДЛЯ РЕВЬЮ:"
+
+    blocks = []
+    for t in targets:
+        lang = LANG_BY_EXT.get(Path(t["path"]).suffix.lower(), "?")
+        blocks.append(
+            f"\n--- {t['path']} (статус {t['status']}, язык {lang}) ---\n"
+            f"GIT DIFF:\n{t['diff'] or '(новый файл; см. полный текст ниже)'}\n"
+            f"ПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:\n{t['new_text'] or '(файл удалён)'}"
+        )
+
+    groups = []
+    cur = ""
+    for b in blocks:
+        candidate = cur + b
+        if cur and len(base) + len(candidate) > max_chars:
+            groups.append(cur)
+            cur = b
+        else:
+            cur = candidate
+    if cur:
+        groups.append(cur)
+
+    tail = (
+        "\n\nЗАДАЧА: найди реальные проблемы в изменениях перечисленных файлов "
+        "(баги, null/типизация, безопасность, async, производительность, "
+        "SQL-инъекции и т.п.) с учётом контекста проекта и описания изменений.\n"
+        "Каждое замечание обязано опираться на конкретную строку нового файла; "
+        "в evidence вставь ТОЧНУЮ подстроку кода из нового файла или diff. "
+        "Без подтверждения — не создавай замечание.\n"
+        "Верни СТРОГО такой JSON: {\"findings\": [{\"file\": \"относительный путь\", "
+        "\"severity\": \"critical|high|medium|low|nit\", \"category\": \"...\", "
+        "\"line\": 42, \"title\": \"кратко\", \"comment\": \"...\", "
+        "\"suggestion\": \"...\", \"evidence\": \"подстрока кода\"}]}\n"
+        "Если проблем нет — верни {\"findings\": []}. Нумерация строк — по новому файлу."
+    )
+
+    all_findings = []
+    usage_tot = {}
+    errors = []
+    for gi, g in enumerate(groups):
+        prompt = base + g + tail
+        if len(prompt) > max_chars:
+            prompt = prompt[:max_chars] + "\n... [контекст усечён по лимиту]"
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT + " В каждом замечании указывай поле file."},
+            {"role": "user", "content": prompt},
+        ]
+        print(f"[Система] batch-промпт {gi + 1}/{len(groups)} ({len(prompt)} симв.)")
+        last_err = ""
+        for attempt in range(retries + 1):
+            try:
+                content, usage = chat(messages, model)
+                data = extract_json(content)
+                findings = data.get("findings", [])
+                if not isinstance(findings, list):
+                    raise ValueError('поле "findings" не массив')
+                all_findings += findings
+                for k in usage_tot:
+                    usage_tot[k] = usage_tot.get(k, 0) + int(usage.get(k, 0) or 0)
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                messages.append({
+                    "role": "user",
+                    "content": f"Ответ не распарсился ({last_err}). Верни ТОЛЬКО валидный JSON.",
+                })
+        else:
+            errors.append(f"промпт {gi + 1}: {last_err}")
+    return all_findings, usage_tot, "; ".join(errors)
+
+
 def build_user_prompt(target, repo_map, related, max_chars, description=""):
     parts = [
         f"ФАЙЛ: {target['path']} (статус {target['status']}, язык "
@@ -443,7 +552,6 @@ def build_user_prompt(target, repo_map, related, max_chars, description=""):
         ]
     parts += [
         "",
-        "GIT DIFF:",
         "GIT DIFF:",
         target["diff"] or "(нет текстового diff, новый файл)",
         "",
@@ -592,9 +700,11 @@ def main():
     ap.add_argument("--max-context-chars", type=int, default=24000,
                     help="бюджет контекста на один файл (символы)")
     ap.add_argument("--max-tokens", type=int, default=1800, help="максимум токенов ответа")
-    ap.add_argument("--out", help="путь к файлу отчёта (по умолчанию рядом со скриптом)")
+    ap.add_argument("--out", help="путь к файлу отчёта (по умолчанию reviews/ рядом со скриптом)")
     ap.add_argument("--description", help="текстовое описание того, что сделано в изменениях")
     ap.add_argument("--description-file", help="файл с описанием изменений (UTF-8)")
+    ap.add_argument("--batch", action="store_true",
+                    help="проверять все изменённые файлы одним промптом")
     ap.add_argument("--no-llm", action="store_true", help="только git+контекст, без модели")
     ap.add_argument("--list", action="store_true", help="показать изменённые файлы и выйти")
     args = ap.parse_args()
@@ -652,30 +762,49 @@ def main():
     tokens_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     started = time.time()
 
-    for i, t in enumerate(targets, 1):
-        print(f"\n[{i}/{len(targets)}] {t['path']} ...")
-        related = find_related_files(repo, t["path"], index, cache)
-        if args.no_llm:
-            by_file[t["path"]] = []
-            print(f"    diff={len(t['diff'])} симв., связанных файлов={len(related)}")
-            continue
-        findings, usage, err = review_file(t, repo_map, related, model,
-                                           args.max_context_chars,
-                                           description=description)
+    if args.batch and not args.no_llm:
+        print("[Система] Режим batch: все изменённые файлы — одним промптом.")
+        findings, batch_usage, err = review_batch(
+            targets, repo_map, model, args.max_context_chars, description)
         for k in tokens_total:
-            tokens_total[k] += int(usage.get(k, 0) or 0)
+            tokens_total[k] += int(batch_usage.get(k, 0) or 0)
         if err:
-            errors.append({"file": t["path"], "error": err})
+            errors.append({"file": "(batch)", "error": err})
             print(f"    [Ошибка] {err}")
-            continue
-        accepted, rej = ground_findings(findings, t["new_text"], t["old_text"], t["diff"])
-        for r in rej:
-            rejected.append({"file": t["path"], **r})
-        by_file[t["path"]] = accepted
+        accepted, rej = ground_batch(findings, {t["path"]: t for t in targets})
+        for item in rej:
+            rejected.append(item)
         for f in accepted:
+            fpath = f.get("file", "?")
+            by_file.setdefault(fpath, []).append(f)
             sev = f["severity"]
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
         print(f"    замечаний: {len(accepted)} (отклонено {len(rej)})")
+    else:
+        for i, t in enumerate(targets, 1):
+            print(f"\n[{i}/{len(targets)}] {t['path']} ...")
+            related = find_related_files(repo, t["path"], index, cache)
+            if args.no_llm:
+                by_file[t["path"]] = []
+                print(f"    diff={len(t['diff'])} симв., связанных файлов={len(related)}")
+                continue
+            findings, usage, err = review_file(t, repo_map, related, model,
+                                               args.max_context_chars,
+                                               description=description)
+            for k in tokens_total:
+                tokens_total[k] += int(usage.get(k, 0) or 0)
+            if err:
+                errors.append({"file": t["path"], "error": err})
+                print(f"    [Ошибка] {err}")
+                continue
+            accepted, rej = ground_findings(findings, t["new_text"], t["old_text"], t["diff"])
+            for r in rej:
+                rejected.append({"file": t["path"], **r})
+            by_file[t["path"]] = accepted
+            for f in accepted:
+                sev = f["severity"]
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            print(f"    замечаний: {len(accepted)} (отклонено {len(rej)})")
 
     duration = time.time() - started
 
@@ -683,7 +812,9 @@ def main():
         out_path = Path(args.out)
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = SCRIPT_DIR / f"code_review_{stamp}.md"
+        reviews_dir = SCRIPT_DIR / "reviews"
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+        out_path = reviews_dir / f"code_review_{stamp}.md"
 
     write_report(out_path, {
         "repo": repo, "mode": mode, "model": model,
