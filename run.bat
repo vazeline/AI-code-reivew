@@ -1,1 +1,1 @@
-python gui_review.py
+pythonw gui_review.py

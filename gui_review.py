@@ -44,7 +44,7 @@ def save_state(app):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({
-            "folder": app.folder_var.get(),
+            "project": app.proj_var.get(),
             "model": app.model_var.get(),
             "open_npp": app.open_npp_var.get(),
             "batch": app.batch_var.get(),
@@ -61,9 +61,9 @@ def load_state(app):
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    folder = str(data.get("folder", "")).strip().strip('"')
-    if folder and os.path.isdir(folder):
-        app.folder_var.set(os.path.normpath(folder))
+    proj = str(data.get("project", "")).strip().strip('"')
+    if proj and os.path.isfile(proj):
+        app.proj_var.set(os.path.normpath(proj))
     model = str(data.get("model", ""))
     if model and model in app.model_combo.cget("values"):
         app.model_var.set(model)
@@ -122,15 +122,15 @@ class ReviewApp(tk.Tk):
         right.rowconfigure(0, weight=1)
         pw.add(right, weight=2)
 
-        ttk.Label(left, text="Папка проекта (git-репозиторий):").grid(
+        ttk.Label(left, text="Проект или солюшен (.sln/.slnx/.csproj):").grid(
             row=0, column=0, sticky="w")
-        folder_row = ttk.Frame(left)
-        folder_row.grid(row=1, column=0, sticky="ew", pady=(2, 8))
-        folder_row.columnconfigure(0, weight=1)
-        self.folder_var = tk.StringVar()
-        ttk.Entry(folder_row, textvariable=self.folder_var).grid(
+        proj_row = ttk.Frame(left)
+        proj_row.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        proj_row.columnconfigure(0, weight=1)
+        self.proj_var = tk.StringVar()
+        ttk.Entry(proj_row, textvariable=self.proj_var).grid(
             row=0, column=0, sticky="ew")
-        ttk.Button(folder_row, text="Обзор…", command=self._browse).grid(
+        ttk.Button(proj_row, text="Обзор…", command=self._browse).grid(
             row=0, column=1, padx=(6, 0))
 
         ttk.Label(left, text="Что сделано в этих изменениях (описание):").grid(
@@ -182,8 +182,6 @@ class ReviewApp(tk.Tk):
         sb.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=sb.set)
 
-        ttk.Label(left, text="Совет: запускайте через pythonw gui_review.py, чтобы не было консоли.",
-                  foreground="#777").grid(row=6, column=0, sticky="w", pady=(6, 0))
 
         prompt_frame = ttk.LabelFrame(right, text="Промпт (отправляется в модель)",
                                       padding=4)
@@ -204,10 +202,14 @@ class ReviewApp(tk.Tk):
         self._prompt_last = None
 
     def _browse(self):
-        initial = self.folder_var.get() or str(Path.home())
-        chosen = filedialog.askdirectory(initialdir=initial, title="Выберите папку проекта")
+        initial = os.path.dirname(self.proj_var.get()) or str(Path.home())
+        chosen = filedialog.askopenfilename(
+            initialdir=initial, title="Выберите проект или солюшен",
+            filetypes=[("Проекты/солюшены",
+                        "*.sln *.slnx *.csproj *.vbproj *.fsproj *.vcxproj *.sqlproj *.proj"),
+                       ("Все файлы", "*.*")])
         if chosen:
-            self.folder_var.set(os.path.normpath(chosen))
+            self.proj_var.set(os.path.normpath(chosen))
             save_state(self)
 
     def _fetch_models(self):
@@ -239,10 +241,12 @@ class ReviewApp(tk.Tk):
     def _run(self):
         if self.proc is not None and self.proc.poll() is None:
             return
-        folder = self.folder_var.get().strip().strip('"')
-        if not folder or not os.path.isdir(folder):
-            messagebox.showerror("Ошибка", "Укажите существующую папку проекта.")
+        proj = self.proj_var.get().strip().strip('"')
+        if not proj or not os.path.isfile(proj):
+            messagebox.showerror("Ошибка",
+                                 "Укажите файл проекта/солюшена (.sln/.slnx/.csproj…).")
             return
+        target = os.path.normpath(proj)
         if not AGENT.is_file():
             messagebox.showerror("Ошибка", f"Не найден {AGENT}")
             return
@@ -267,7 +271,7 @@ class ReviewApp(tk.Tk):
         self.prompt_text.delete("1.0", "end")
         self.prompt_text.configure(state="disabled")
 
-        cmd = [sys.executable, str(AGENT), folder, "--out", str(self.out_path)]
+        cmd = [sys.executable, str(AGENT), target, "--out", str(self.out_path)]
         cmd += ["--prompt-file", self.prompt_file]
         model = self.model_var.get().strip()
         if model and model != AUTO_MODEL_LABEL:

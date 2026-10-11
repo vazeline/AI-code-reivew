@@ -19,6 +19,8 @@
 
 Примеры:
     python agent_system.py "C:\\path\\to\\repo"
+    python agent_system.py "C:\\path\\to\\repo\\My.sln"   # только этот солюшен
+    python agent_system.py "C:\\path\\to\\repo\\App\\App.csproj"
     python agent_system.py . --base main
     python agent_system.py . --staged
     python agent_system.py . --last
@@ -77,6 +79,13 @@ LANG_BY_EXT = {
 }
 
 CODE_EXT = set(LANG_BY_EXT)
+
+PROJECT_SOLUTION_EXT = {
+    ".sln", ".slnx",                 # солюшены .NET (классический и XML-формат VS)
+    ".csproj", ".vbproj", ".fsproj", # C# / VB / F#
+    ".vcxproj", ".sqlproj", ".wixproj",
+    ".proj",
+}
 
 EXCLUDE_DIRS = {
     ".git", "node_modules", "bin", "obj", "dist", "build", ".vs", ".idea",
@@ -210,26 +219,30 @@ def chat(messages, model, temperature=0.1, max_tokens=4096, timeout=600,
         raise
 
 
-def compile_project(repo: Path, targets) -> dict:
-    changed_py = [t["path"] for t in targets if t["path"].endswith(".py")]
-    slns = sorted(repo.glob("*.sln")) + sorted(repo.glob("*.slnx"))
-    csprojs = sorted(repo.glob("*.csproj"))
-    tsconfigs = sorted(repo.glob("tsconfig.json")) + sorted(repo.glob("*/*.tsconfig*.json"))[:1]
-
-    if slns or csprojs:
-        proj = str(slns[0]) if slns else str(csprojs[0])
-        cmd = ["dotnet", "build", proj, "--nologo", "-v", "m"]
+def compile_project(repo: Path, targets, project_file=None) -> dict:
+    if project_file is not None and project_file.suffix.lower() in PROJECT_SOLUTION_EXT:
+        cmd = ["dotnet", "build", str(project_file), "--nologo", "-v", "m"]
         kind = ".NET (dotnet build)"
-    elif tsconfigs and any(t["path"].endswith((".ts", ".tsx", ".js", ".jsx")) for t in targets):
-        cmd = ["npx", "--no-install", "tsc", "--noEmit", "-p", "."]
-        kind = "TypeScript (tsc --noEmit)"
-    elif changed_py:
-        cmd = [sys.executable, "-m", "py_compile", *changed_py]
-        kind = "Python (py_compile)"
     else:
-        return {"kind": "нет статической компиляции (SQL/прочее)",
-                "cmd": "", "ok": True, "output": "",
-                "duration": 0.0}
+        changed_py = [t["path"] for t in targets if t["path"].endswith(".py")]
+        slns = sorted(repo.glob("*.sln")) + sorted(repo.glob("*.slnx"))
+        csprojs = sorted(repo.glob("*.csproj"))
+        tsconfigs = sorted(repo.glob("tsconfig.json")) + sorted(repo.glob("*/*.tsconfig*.json"))[:1]
+
+        if slns or csprojs:
+            proj = str(slns[0]) if slns else str(csprojs[0])
+            cmd = ["dotnet", "build", proj, "--nologo", "-v", "m"]
+            kind = ".NET (dotnet build)"
+        elif tsconfigs and any(t["path"].endswith((".ts", ".tsx", ".js", ".jsx")) for t in targets):
+            cmd = ["npx", "--no-install", "tsc", "--noEmit", "-p", "."]
+            kind = "TypeScript (tsc --noEmit)"
+        elif changed_py:
+            cmd = [sys.executable, "-m", "py_compile", *changed_py]
+            kind = "Python (py_compile)"
+        else:
+            return {"kind": "нет статической компиляции (SQL/прочее)",
+                    "cmd": "", "ok": True, "output": "",
+                    "duration": 0.0}
 
     for exe in (cmd[0],):
         if exe in ("dotnet", "npx") and subprocess.run(
@@ -276,6 +289,47 @@ def collect_index(repo: Path):
                 if len(index) >= MAX_SCAN_FILES:
                     return index
     return sorted(index)
+
+
+def git_toplevel(path: Path) -> Path:
+    """Корень git-репозитория для пути (сам путь может быть файлом внутри)."""
+    p = run_git(path, "rev-parse", "--show-toplevel")
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip())
+    return Path(p.stdout.strip())
+
+
+def project_dirs(project_file: Path) -> list:
+    """Каталоги, принадлежащие проекту/солюшену (область ревью и сборки)."""
+    suffix = project_file.suffix.lower()
+    if suffix not in (".sln", ".slnx"):
+        return [project_file.parent]  # для проекта — его собственный каталог
+    # солюшен: каталоги входящих в него проектов (+ сам файл солюшена)
+    dirs = set()
+    try:
+        text = project_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return list(dirs)
+    if suffix == ".sln":
+        refs = re.findall(
+            r'Project\("\{[^"]+\}"\) = "[^"]*", "([^"]+)", "\{[^"]+\}"\s*', text)
+    else:
+        refs = re.findall(r'<Project\b[^>]*\bPath="([^"]+)"', text)
+    for rel in refs:
+        p = (project_file.parent / rel.replace("\\", "/")).resolve()
+        if p.suffix.lower() in PROJECT_SOLUTION_EXT and p.exists():
+            dirs.add(p.parent)
+    return list(dirs)
+
+
+def in_project(rel_path, roots_rel) -> bool:
+    """Входит ли относительный путь в область какого-либо корня проекта."""
+    rp = rel_path.replace("\\", "/")
+    for root in roots_rel:
+        root = root.rstrip("/")
+        if rp == root or rp.startswith(root + "/") or root == ".":
+            return True
+    return False
 
 
 def build_project_header(repo: Path, targets) -> str:
@@ -904,7 +958,9 @@ def write_report(path, data):
 
 def main():
     ap = argparse.ArgumentParser(description="Локальный code review через LM Studio")
-    ap.add_argument("repo", nargs="?", default=".", help="путь к папке с git-репозиторием")
+    ap.add_argument("repo", nargs="?", default=".",
+                    help="папка git-репозитория или файл проекта/солюшена "
+                         "(.sln, .slnx, .csproj ... — соберётся и проверяется только он)")
     ap.add_argument("--base", help="сравнивать с веткой/ref (git diff <base>...HEAD)")
     ap.add_argument("--staged", action="store_true", help="только staged-изменения")
     ap.add_argument("--last", action="store_true", help="изменения последнего коммита")
@@ -929,8 +985,17 @@ def main():
     PROMPT_FILE_PATH = args.prompt_file
 
     repo = Path(args.repo).resolve()
-    if not repo.is_dir():
-        print(f"[Ошибка] Папка не найдена: {repo}")
+    project_file = None
+    if repo.is_file() and repo.suffix.lower() in PROJECT_SOLUTION_EXT:
+        project_file = repo
+        try:
+            repo = git_toplevel(repo.parent)
+        except RuntimeError as e:
+            print(f"[Ошибка git] не удалось найти репозиторий для проекта: {e}")
+            return 2
+    elif not repo.is_dir():
+        print(f"[Ошибка] Путь не найден. Укажите папку git-репозитория либо "
+              f"файл проекта/солюшена ({', '.join(sorted(PROJECT_SOLUTION_EXT))}): {repo}")
         return 2
 
     if not git_ok(repo, "rev-parse", "--is-inside-work-tree"):
@@ -944,6 +1009,19 @@ def main():
     except RuntimeError as e:
         print(f"[Ошибка git] {e}")
         return 2
+
+    if project_file is not None:
+        roots_rel = [d.relative_to(repo).as_posix() for d in project_dirs(project_file)]
+        proj_rel = project_file.resolve().relative_to(repo).as_posix()
+        before = len(targets)
+        targets = [t for t in targets
+                   if t["path"] == proj_rel or in_project(t["path"], roots_rel)]
+        if not targets:
+            print("[Система] В указанном проекте/солюшене изменённых файлов нет.")
+            print(f"        (всего изменений в репозитории: {before})")
+            return 0
+        print(f"[Система] Область ограничена проектом: {project_file.name} "
+              f"({len(targets)} файлов из {before} изменённых в репозитории)")
 
     if not targets:
         print("[Система] Изменённых файлов не найдено.")
@@ -977,7 +1055,7 @@ def main():
     build = None
     if not args.no_compile and not getattr(args, "list", False):
         print("[Система] Компилирую проект...")
-        build = compile_project(repo, targets)
+        build = compile_project(repo, targets, project_file=project_file)
         status = "OK" if build.get("ok") else "ПРОВАЛ"
         print(f"[Сборка] {build.get('kind')} ({build.get('duration', 0):.1f} c) -> {status}")
         if not build.get("ok"):
