@@ -100,8 +100,12 @@ MAX_RELATED_CHARS = 6000
 
 SYSTEM_PROMPT = (
     "Ты — опытный senior-инженер, который делает строгое, но по делу code review.\n"
-    "Ты видишь ТОЛЬКО предоставленный diff, полный текст изменённого файла и связанный "
-    "контекст проекта. Не выдумывай код, которого нет.\n"
+    "Ты видишь ТОЛЬКО предоставленный diff и связанный контекст проекта; полные тексты "
+    "файлов в промпт не вкладываются.\n"
+    "Если у тебя есть доступ к файлам проекта (например, через инструменты/MCP — чтение "
+    "файлов по указанным абсолютным путям), открывай их самостоятельно и сверяй по ним "
+    "замечания, особенно для новых файлов, чей текст не включён.\n"
+    "Не выдумывай код, которого нет.\n"
     "Каждое замечание обязано опираться на конкретную строку нового файла.\n"
     "В поле evidence вставь ТОЧНУЮ подстроку кода из нового файла или diff (1-3 строки), "
     "которая подтверждает замечание. Если подтверждения нет — не создавай замечание.\n"
@@ -265,13 +269,26 @@ def compile_project(repo: Path, targets, project_file=None) -> dict:
                 "output": str(e), "duration": time.time() - started}
 
 
+def clean_compile_output(output: str) -> str:
+    """Оставляет в выводе сборки только ошибки (предупреждения убирает)."""
+    keep = []
+    for line in (output or "").splitlines():
+        if re.search(r"\bwarning\b", line, re.I):
+            continue
+        keep.append(line)
+    return "\n".join(keep).strip()
+
+
 def build_info_text(build) -> str:
     if not build or not build.get("cmd"):
         return ""
     if build.get("ok"):
         return f"OK ({build['kind']}, {build['duration']:.1f} c)"
+    cleaned = clean_compile_output(build.get("output") or "")
+    if not cleaned:
+        cleaned = "(без вывода)"
     return (f"ПРОВАЛ ({build['kind']}, {build['duration']:.1f} c)\n"
-            f"{build['output'][:4000] or '(без вывода)'}")
+            f"{cleaned[:4000]}")
 
 
 def collect_index(repo: Path):
@@ -631,7 +648,7 @@ def ground_batch(findings, targets_by_path):
 
 
 def review_batch(targets, project, model, max_chars, description="", retries=2,
-                 think=True, max_tokens=4096, build_info=""):
+                 think=True, max_tokens=4096, build_info="", repo=None):
     base_parts = [project]
     if description.strip():
         base_parts += ["", "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):", description.strip()]
@@ -657,18 +674,22 @@ def review_batch(targets, project, model, max_chars, description="", retries=2,
     blocks = []
     for t in targets:
         lang = LANG_BY_EXT.get(Path(t["path"]).suffix.lower(), "?")
-        diff = t.get("diff") or "(новый файл; см. полный текст ниже)"
-        new_text = t.get("new_text") or "(файл удалён)"
-        is_new = t["status"] == "A" or not (t.get("diff") or "").strip()
-        ratio = 0.35 if is_new else 0.7
-        db = max(max(int(avail * ratio), 0), 0)
-        nb = max(avail - db, 0)
+        diff = t.get("diff") or ""
+        if t["status"] == "D":
+            diff = "(файл удалён)"
+        elif t["status"] == "A" or not diff.strip():
+            abs_path = (repo / t["path"]).resolve()
+            diff = (f"(новый файл — полный текст не включён в промпт. "
+                    f"АБСОЛЮТНЫЙ ПУТЬ: {abs_path}. "
+                    f"Если у тебя есть доступ к файлам проекта — открой файл сам.)")
+        if t["status"] == "D" or (t["status"] == "A" or not (t.get("diff") or "").strip()):
+            db = max(avail, len(diff))
+        else:
+            db = max(avail, 0)
         diff = clip_section(diff, db, f"diff файла {t['path']}")
-        new_text = clip_section(new_text, nb, f"полный текст файла {t['path']}")
         blocks.append(
             f"\n--- {t['path']} (статус {t['status']}, язык {lang}) ---\n"
-            f"GIT DIFF:\n{diff}\n"
-            f"ПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:\n{new_text}"
+            f"GIT DIFF:\n{diff}"
         )
 
     groups = []
@@ -743,7 +764,8 @@ def review_batch(targets, project, model, max_chars, description="", retries=2,
     return all_findings, usage_tot, "; ".join(errors), "\n\n".join(all_reasoning)
 
 
-def build_user_prompt(target, project, related, max_chars, description="", build_info=""):
+def build_user_prompt(target, project, related, max_chars, description="", build_info="",
+                      repo=None):
     path = target["path"]
     lang = LANG_BY_EXT.get(Path(path).suffix.lower(), "?")
     fixed_parts = [
@@ -780,22 +802,32 @@ def build_user_prompt(target, project, related, max_chars, description="", build
         "Если проблем нет — верни {\"findings\": []}. Нумерация строк — по новому файлу.",
     ])
 
-    diff = target["diff"] or "(нет текстового diff, новый файл)"
-    new_text = target["new_text"] if target["new_text"] else "(файл удалён)"
+    diff = target["diff"] or ""
+    is_deleted = target["status"] == "D"
     is_new_file = target["status"] == "A" or not (target["diff"] or "").strip()
+    if is_deleted:
+        diff = "(файл удалён)"
+    elif is_new_file:
+        abs_path = (repo / target["path"]).resolve() if repo else None
+        diff = ("(новый файл — полный текст не включён в промпт. "
+                f"АБСОЛЮТНЫЙ ПУТЬ: {abs_path}. " if abs_path else
+                "(новый файл — полный текст не включён в промпт. ")
+        diff += "Если у тебя есть доступ к файлам проекта — открой файл сам.)"
 
     avail = max_chars - len(head) - len(tail) - 256
-    diff_budget = max(int(avail * (0.35 if is_new_file else 0.65)), 0)
-    new_budget = max(avail - diff_budget, 0)
+    if is_deleted or is_new_file:
+        diff_budget = max(avail, len(diff))
+    else:
+        diff_budget = max(avail, 0)
     diff = clip_section(diff, diff_budget, f"diff файла {path}")
-    new_text = clip_section(new_text, new_budget, f"полный текст файла {path}")
 
-    body = "\n\nGIT DIFF:\n" + diff + "\n\nПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:\n" + new_text
+    body = "\n\nGIT DIFF:\n" + diff
 
     related_budget = max_chars - len(head) - len(tail) - len(body)
     rel_parts = []
     if related and related_budget > 300:
-        rel_lines = ["", "СВЯЗАННЫЕ ФАЙЛЫ (контекст, НЕ рецензируй их отдельно):"]
+        rel_lines = ["", "СВЯЗАННЫЕ ФАЙЛЫ (выдержки-контекст, НЕ рецензируй их отдельно; "
+                     "при доступе к файлам открывай их целиком сам):"]
         for rel, body_txt in related:
             rel_lines.append(f"--- {rel} ---\n{body_txt}")
         rel_text = "\n".join(rel_lines)
@@ -808,8 +840,9 @@ def build_user_prompt(target, project, related, max_chars, description="", build
 
 
 def review_file(target, project, related, model, max_chars, retries=2, description="",
-                build_info="", think=True, max_tokens=4096):
-    user = build_user_prompt(target, project, related, max_chars, description, build_info)
+                build_info="", think=True, max_tokens=4096, repo=None):
+    user = build_user_prompt(target, project, related, max_chars, description, build_info,
+                             repo=repo)
     save_prompt(user)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -1074,7 +1107,8 @@ def main():
         print("[Система] Режим batch: все изменённые файлы — одним промптом.")
         findings, batch_usage, err, reasoning = review_batch(
             targets, project, model, args.max_context_chars, description,
-            think=not args.no_thinking, max_tokens=args.max_tokens, build_info=build_text)
+            think=not args.no_thinking, max_tokens=args.max_tokens, build_info=build_text,
+            repo=repo)
         reasoning_map["(batch)"] = reasoning
         for k in tokens_total:
             tokens_total[k] += int(batch_usage.get(k, 0) or 0)
@@ -1101,7 +1135,7 @@ def main():
             findings, usage, err, reasoning = review_file(
                 t, project, related, model, args.max_context_chars,
                 description=description, build_info=build_text,
-                think=not args.no_thinking, max_tokens=args.max_tokens)
+                think=not args.no_thinking, max_tokens=args.max_tokens, repo=repo)
             reasoning_map[t["path"]] = reasoning
             for k in tokens_total:
                 tokens_total[k] += int(usage.get(k, 0) or 0)
