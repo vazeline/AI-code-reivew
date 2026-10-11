@@ -107,14 +107,24 @@ class ReviewApp(tk.Tk):
     def _build_ui(self):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
-        root.columnconfigure(0, weight=3)
-        root.columnconfigure(1, weight=2)
-        root.rowconfigure(3, weight=1)
-        root.rowconfigure(5, weight=2)
 
-        ttk.Label(root, text="Папка проекта (git-репозиторий):").grid(
+        pw = ttk.Panedwindow(root, orient="horizontal")
+        pw.pack(fill="both", expand=True)
+
+        left = ttk.Frame(pw, padding=(0, 0, 12, 0))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(3, weight=1)
+        left.rowconfigure(5, weight=2)
+        pw.add(left, weight=3)
+
+        right = ttk.Frame(pw)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+        pw.add(right, weight=2)
+
+        ttk.Label(left, text="Папка проекта (git-репозиторий):").grid(
             row=0, column=0, sticky="w")
-        folder_row = ttk.Frame(root)
+        folder_row = ttk.Frame(left)
         folder_row.grid(row=1, column=0, sticky="ew", pady=(2, 8))
         folder_row.columnconfigure(0, weight=1)
         self.folder_var = tk.StringVar()
@@ -123,19 +133,20 @@ class ReviewApp(tk.Tk):
         ttk.Button(folder_row, text="Обзор…", command=self._browse).grid(
             row=0, column=1, padx=(6, 0))
 
-        ttk.Label(root, text="Что сделано в этих изменениях (описание):").grid(
+        ttk.Label(left, text="Что сделано в этих изменениях (описание):").grid(
             row=2, column=0, sticky="nw")
-        self.desc_text = tk.Text(root, height=6, wrap="word", undo=True)
+        self.desc_text = tk.Text(left, height=6, wrap="word", undo=True)
         self.desc_text.grid(row=3, column=0, sticky="nsew", pady=(2, 8))
 
-        opts = ttk.Frame(root)
+        opts = ttk.Frame(left)
         opts.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         opts.columnconfigure(1, weight=1)
         ttk.Label(opts, text="Модель:").grid(row=0, column=0, sticky="w")
         self.model_var = tk.StringVar(value=AUTO_MODEL_LABEL)
         self.model_combo = ttk.Combobox(
-            opts, textvariable=self.model_var, values=[AUTO_MODEL_LABEL])
-        self.model_combo.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+            opts, textvariable=self.model_var, values=[AUTO_MODEL_LABEL],
+            width=30)
+        self.model_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
         self.open_npp_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Открыть отчёт в Notepad++ по завершении",
                         variable=self.open_npp_var).grid(row=0, column=2, sticky="e")
@@ -152,7 +163,7 @@ class ReviewApp(tk.Tk):
                         variable=self.thinking_var).grid(
             row=1, column=2, sticky="e", pady=(6, 0))
 
-        btns = ttk.Frame(root)
+        btns = ttk.Frame(left)
         btns.grid(row=5, column=0, sticky="new")
         self.run_btn = ttk.Button(btns, text="Запуск", command=self._run)
         self.run_btn.pack(side="left")
@@ -161,7 +172,7 @@ class ReviewApp(tk.Tk):
         self.status_var = tk.StringVar(value="Готово к запуску")
         ttk.Label(btns, textvariable=self.status_var).pack(side="left", padx=(12, 0))
 
-        log_frame = ttk.LabelFrame(root, text="Журнал", padding=4)
+        log_frame = ttk.LabelFrame(left, text="Журнал", padding=4)
         log_frame.grid(row=5, column=0, sticky="nsew", pady=(40, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -171,22 +182,26 @@ class ReviewApp(tk.Tk):
         sb.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=sb.set)
 
-        prompt_frame = ttk.LabelFrame(root, text="Промпт (отправляется в модель)",
+        ttk.Label(left, text="Совет: запускайте через pythonw gui_review.py, чтобы не было консоли.",
+                  foreground="#777").grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+        prompt_frame = ttk.LabelFrame(right, text="Промпт (отправляется в модель)",
                                       padding=4)
-        prompt_frame.grid(row=0, column=1, rowspan=7, sticky="nsew", padx=(12, 0))
+        prompt_frame.grid(row=0, column=0, sticky="nsew")
         prompt_frame.columnconfigure(0, weight=1)
         prompt_frame.rowconfigure(0, weight=1)
         self.prompt_text = tk.Text(prompt_frame, state="disabled", wrap="none",
                                    font=("Consolas", 9))
         self.prompt_text.grid(row=0, column=0, sticky="nsew")
-        psb = ttk.Scrollbar(prompt_frame, command=self.prompt_text.yview)
-        psb.grid(row=0, column=1, sticky="ns")
-        self.prompt_text.configure(yscrollcommand=psb.set)
+        psb_y = ttk.Scrollbar(prompt_frame, command=self.prompt_text.yview)
+        psb_y.grid(row=0, column=1, sticky="ns")
+        psb_x = ttk.Scrollbar(prompt_frame, orient="horizontal",
+                              command=self.prompt_text.xview)
+        psb_x.grid(row=1, column=0, sticky="ew")
+        self.prompt_text.configure(yscrollcommand=psb_y.set,
+                                   xscrollcommand=psb_x.set)
         self.prompt_text.insert("1.0", "Промпт появится после запуска ревью.")
         self._prompt_last = None
-
-        ttk.Label(root, text="Совет: запускайте через pythonw gui_review.py, чтобы не было консоли.",
-                  foreground="#777").grid(row=6, column=0, sticky="w", pady=(6, 0))
 
     def _browse(self):
         initial = self.folder_var.get() or str(Path.home())
