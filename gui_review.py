@@ -46,6 +46,7 @@ def save_state(app):
         tmp.write_text(json.dumps({
             "project": app.proj_var.get(),
             "model": app.model_var.get(),
+            "extra_open": bool(app.extra.winfo_manager()),
             "open_npp": app.open_npp_var.get(),
             "batch": app.batch_var.get(),
             "compile": app.compile_var.get(),
@@ -67,6 +68,8 @@ def load_state(app):
     model = str(data.get("model", ""))
     if model and model in app.model_combo.cget("values"):
         app.model_var.set(model)
+    if data.get("extra_open") is False:
+        app._toggle_extra()
     for var, key in ((app.open_npp_var, "open_npp"),
                      (app.batch_var, "batch"),
                      (app.compile_var, "compile"),
@@ -147,21 +150,32 @@ class ReviewApp(tk.Tk):
             opts, textvariable=self.model_var, values=[AUTO_MODEL_LABEL],
             width=30)
         self.model_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        self.extra_toggle = ttk.Label(opts, text="\u25BE Дополнительные настройки",
+                                      cursor="hand2")
+        self.extra_toggle.grid(row=1, column=0, columnspan=2, sticky="w",
+                               pady=(6, 0))
+        self.extra_toggle.bind("<Button-1>", lambda e: self._toggle_extra())
+
+        self.extra = ttk.Frame(opts)
+        self.extra.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.extra.columnconfigure(1, weight=1)
         self.open_npp_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Открыть отчёт в Notepad++ по завершении",
-                        variable=self.open_npp_var).grid(row=0, column=2, sticky="e")
         self.batch_var = tk.BooleanVar(value=False)
         self.compile_var = tk.BooleanVar(value=True)
         self.thinking_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Все файлы одним промптом (batch)",
+        ttk.Checkbutton(self.extra, text="Открыть отчёт в Notepad++",
+                        variable=self.open_npp_var).grid(
+            row=0, column=0, sticky="w")
+        ttk.Checkbutton(self.extra, text="Все файлы одним промптом (batch)",
                         variable=self.batch_var).grid(
-            row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(opts, text="Компилировать проект",
+            row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Checkbutton(self.extra, text="Компилировать проект",
                         variable=self.compile_var).grid(
-            row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(opts, text="Reasoning (thinking)",
+            row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(self.extra, text="Reasoning (thinking)",
                         variable=self.thinking_var).grid(
-            row=1, column=2, sticky="e", pady=(6, 0))
+            row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
 
         btns = ttk.Frame(left)
         btns.grid(row=5, column=0, sticky="new")
@@ -227,6 +241,14 @@ class ReviewApp(tk.Tk):
         self.model_combo.configure(values=values)
         if self.model_var.get() not in values:
             self.model_var.set(AUTO_MODEL_LABEL)
+
+    def _toggle_extra(self):
+        if bool(self.extra.winfo_manager()):
+            self.extra.grid_remove()
+            self.extra_toggle.configure(text="\u25B8 Дополнительные настройки")
+        else:
+            self.extra.grid()
+            self.extra_toggle.configure(text="\u25BE Дополнительные настройки")
 
     def _append(self, text):
         self.log.configure(state="normal")
