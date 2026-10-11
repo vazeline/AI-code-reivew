@@ -5,12 +5,13 @@
 Пайплайн:
   1. Находит изменённые файлы в git-репозитории.
      Режимы: uncommitted (staged+unstaged), --staged, --last, --base <ref>.
-  2. Собирает контекст ВСЕГО проекта:
-        - карта репозитория (дерево файлов);
+  2. Собирает контекст:
+        - короткий заголовок: папка проекта и список изменённых файлов;
         - связанные файлы: импорты/require для TS/JS, namespace/using для C#,
-          ссылки на объекты для SQL, плюс эвристический поиск по всему коду.
+          ссылки на объекты для SQL, плюс эвристический поиск по коду.
   3. Для каждого изменённого файла просит локальную LLM вернуть строгий JSON
-     с замечаниями.
+     с замечаниями. Модель вызывается со стримингом (live-вывод) и reasoning
+     (enable_thinking); reasoning сохраняется в отчёт.
   4. Механически валидирует ответ: JSON-схема + привязка строк и фрагментов
      к реальному коду (grounding). Непривязанные "галлюцинации" отбрасываются.
   5. Пишет Markdown-отчёт в подпапку reviews/ (добавлена в .gitignore).
@@ -38,7 +39,7 @@ import requests
 
 for _stream in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+        _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except (AttributeError, ValueError):
         pass
 
@@ -87,7 +88,6 @@ MAX_FILE_BYTES = 1_000_000
 MAX_SCAN_FILES = 4000
 MAX_RELATED_FILES = 5
 MAX_RELATED_CHARS = 6000
-MAX_MAP_ENTRIES = 600
 
 SYSTEM_PROMPT = (
     "Ты — опытный senior-инженер, который делает строгое, но по делу code review.\n"
@@ -139,18 +139,126 @@ def detect_model() -> str:
     return os.environ.get("LM_MODEL", "local-model")
 
 
-def chat(messages, model, temperature=0.1, max_tokens=1800, timeout=600):
+PROMPT_FILE_PATH = None
+
+
+def save_prompt(text):
+    """Сохраняет отправляемый промпт в файл (для GUI/отладки)."""
+    if PROMPT_FILE_PATH:
+        try:
+            Path(PROMPT_FILE_PATH).write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+
+
+def chat(messages, model, temperature=0.1, max_tokens=4096, timeout=600,
+         think=True, on_delta=None):
     payload = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": True,
     }
-    r = requests.post(f"{LM_STUDIO_BASE}/chat/completions", json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    content = data["choices"][0]["message"]["content"] or ""
-    return content, data.get("usage", {})
+    if think:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+
+    def _run():
+        with requests.post(f"{LM_STUDIO_BASE}/chat/completions", json=payload,
+                           timeout=timeout, stream=True) as resp:
+            resp.raise_for_status()
+            content, reasoning, usage = [], [], {}
+            for raw in resp.iter_lines(decode_unicode=False):
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk.get("usage") or {}
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content") or ""
+                rr = delta.get("reasoning_content") or ""
+                if piece:
+                    content.append(piece)
+                    if on_delta:
+                        on_delta("content", piece)
+                if rr:
+                    reasoning.append(rr)
+                    if on_delta:
+                        on_delta("reasoning", rr)
+        return "".join(content), "".join(reasoning), usage
+
+    try:
+        return _run()
+    except requests.exceptions.HTTPError as e:
+        if think and e.response is not None and e.response.status_code in (400, 422):
+            payload.pop("chat_template_kwargs", None)
+            return _run()
+        raise
+
+
+def compile_project(repo: Path, targets) -> dict:
+    changed_py = [t["path"] for t in targets if t["path"].endswith(".py")]
+    slns = sorted(repo.glob("*.sln")) + sorted(repo.glob("*.slnx"))
+    csprojs = sorted(repo.glob("*.csproj"))
+    tsconfigs = sorted(repo.glob("tsconfig.json")) + sorted(repo.glob("*/*.tsconfig*.json"))[:1]
+
+    if slns or csprojs:
+        proj = str(slns[0]) if slns else str(csprojs[0])
+        cmd = ["dotnet", "build", proj, "--nologo", "-v", "m"]
+        kind = ".NET (dotnet build)"
+    elif tsconfigs and any(t["path"].endswith((".ts", ".tsx", ".js", ".jsx")) for t in targets):
+        cmd = ["npx", "--no-install", "tsc", "--noEmit", "-p", "."]
+        kind = "TypeScript (tsc --noEmit)"
+    elif changed_py:
+        cmd = [sys.executable, "-m", "py_compile", *changed_py]
+        kind = "Python (py_compile)"
+    else:
+        return {"kind": "нет статической компиляции (SQL/прочее)",
+                "cmd": "", "ok": True, "output": "",
+                "duration": 0.0}
+
+    for exe in (cmd[0],):
+        if exe in ("dotnet", "npx") and subprocess.run(
+                ["where", exe], capture_output=True, shell=True).returncode != 0:
+            return {"kind": kind, "cmd": " ".join(cmd), "ok": False,
+                    "output": f"утилита '{exe}' не найдена в PATH", "duration": 0.0}
+
+    started = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=300)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        return {"kind": kind, "cmd": " ".join(cmd), "ok": proc.returncode == 0,
+                "output": output.strip()[-16000:], "duration": time.time() - started}
+    except subprocess.TimeoutExpired:
+        return {"kind": kind, "cmd": " ".join(cmd), "ok": False,
+                "output": "сборка превысила таймаут 300 c", "duration": time.time() - started}
+    except Exception as e:
+        return {"kind": kind, "cmd": " ".join(cmd), "ok": False,
+                "output": str(e), "duration": time.time() - started}
+
+
+def build_info_text(build) -> str:
+    if not build or not build.get("cmd"):
+        return ""
+    if build.get("ok"):
+        return f"OK ({build['kind']}, {build['duration']:.1f} c)"
+    return (f"ПРОВАЛ ({build['kind']}, {build['duration']:.1f} c)\n"
+            f"{build['output'][:4000] or '(без вывода)'}")
 
 
 def collect_index(repo: Path):
@@ -170,23 +278,20 @@ def collect_index(repo: Path):
     return sorted(index)
 
 
-def build_repo_map(index) -> str:
-    if not index:
-        return "(пусто)"
-    by_dir = {}
-    for rel in index:
-        parent = str(Path(rel).parent)
-        parent = "." if parent == "." else parent
-        by_dir.setdefault(parent, []).append(Path(rel).name)
-    lines = []
-    for i, d in enumerate(sorted(by_dir)):
-        if i >= MAX_MAP_ENTRIES:
-            lines.append(f"... и ещё {len(by_dir) - i} каталогов")
-            break
-        names = sorted(by_dir[d])[:20]
-        suffix = "" if len(by_dir[d]) <= 20 else f" (+{len(by_dir[d]) - 20})"
-        lines.append(f"{d}/: {', '.join(names)}{suffix}")
-    return "\n".join(lines)
+def build_project_header(repo: Path, targets) -> str:
+    """Короткий заголовок промпта: папка проекта + изменённые файлы."""
+    files = ", ".join(f"{t['path']} ({t['status']})" for t in targets)
+    return f"ПРОЕКТ (папка): {repo}\nИЗМЕНЁННЫЕ ФАЙЛЫ: {files}"
+
+
+def clip_section(text, limit, what):
+    """Обрезает секцию промпта до лимита с заметкой в лог и в текст."""
+    if len(text) <= limit:
+        return text
+    print(f"[Система] {what}: {len(text)} симв. — больше бюджета промпта, "
+          f"усечено до {max(0, limit)} симв.", flush=True)
+    marker = f"\n... [ПРЕДУПРЕЖДЕНИЕ: {what} обрезан; лимит {limit} симв.]"
+    return text[:max(0, limit - len(marker))] + marker
 
 
 def resolve_review_target(args):
@@ -220,9 +325,12 @@ def changed_files(repo: Path, diff_args, base_ref, include_untracked=True):
     if include_untracked and diff_args == ["HEAD"]:
         untracked = git_output(repo, "ls-files", "--others", "--exclude-standard")
         for path in untracked.splitlines():
-            path = path.strip()
-            if path:
-                entries.append(("A", path, path))
+            path = norm_path(path)
+            if not path or not Path(path).suffix.lower() in CODE_EXT:
+                continue
+            if any(part in EXCLUDE_DIRS for part in path.split("/")):
+                continue
+            entries.append(("A", path, path))
 
     result = []
     for status, old, new in entries:
@@ -362,14 +470,11 @@ def find_related_files(repo: Path, path: str, index, cache: dict):
 
 
 def mechanical_checks(repo: Path, diff_args) -> str:
-    lines = []
-    try:
-        out = git_output(repo, "diff", "--check", *diff_args)
-        lines.append("git diff --check: OK (пробельные ошибки/маркеры конфликтов не найдены)"
-                     if not out.strip() else f"git diff --check:\n{out.strip()}")
-    except RuntimeError as e:
-        lines.append(f"git diff --check: не удалось ({e})")
-    return "\n".join(lines)
+    p = run_git(repo, "diff", "--check", *diff_args)
+    if p.returncode == 0:
+        return "git diff --check: OK (пробельные ошибки/маркеры конфликтов не найдены)"
+    out = (p.stdout or "") + (p.stderr or "")
+    return f"git diff --check: найдены проблемы:\n{out.strip()}"
 
 
 def extract_json(text: str):
@@ -403,25 +508,39 @@ def ground_findings(findings, new_text, old_text, diff_text):
         if sev not in ALLOWED_SEVERITY:
             sev = "medium"
         f["severity"] = sev
+        f["title"] = str(f.get("title") or f.get("message") or "").strip()
+        f["comment"] = str(f.get("comment") or f.get("message") or "").strip()
         try:
             line = int(f.get("line", 0))
         except (TypeError, ValueError):
             line = 0
+        evidence = str(f.get("evidence", "") or "").strip()
+        ev_norm = normalize_ws(evidence)
+        ev_ok = bool(evidence) and ev_norm in haystack
+
+        line_ok = 1 <= line <= len(new_lines)
+        if not line_ok and ev_ok:
+            hit = next((i for i, ln in enumerate(new_lines, 1)
+                        if ev_norm in normalize_ws(ln)), None)
+            if hit:
+                line = hit
+                line_ok = True
+        if not line_ok and not new_lines and old_text and 1 <= line <= len(old_lines):
+            line_ok = True
         f["line"] = line
 
-        evidence = str(f.get("evidence", "") or "")
-        line_ok = 1 <= line <= len(new_lines)
-        deleted_ok = (not new_lines and old_text and 1 <= line <= len(old_lines))
-        ev_ok = bool(evidence.strip()) and normalize_ws(evidence) in haystack
-
-        if not line_ok and not deleted_ok:
-            rejected.append({"finding": f, "reason": f"строки {line} нет в файле"})
+        if not line_ok:
+            rejected.append({"finding": f,
+                             "reason": f"строки {line} нет в файле"})
             continue
-        if evidence.strip() and not ev_ok:
+        if evidence and not ev_ok:
             rejected.append({"finding": f, "reason": "evidence не найден в коде/diff"})
             continue
-        if not evidence.strip():
-            f["evidence"] = new_lines[line - 1].strip() if line_ok else ""
+        if not evidence:
+            if line <= len(new_lines):
+                f["evidence"] = new_lines[line - 1].strip()
+            elif old_text:
+                f["evidence"] = old_lines[line - 1].strip()
         f["grounded"] = True
         accepted.append(f)
 
@@ -457,35 +576,14 @@ def ground_batch(findings, targets_by_path):
     return accepted, rejected
 
 
-def review_batch(targets, repo_map, model, max_chars, description="", retries=2):
-    base = [
-        "КАРТА РЕПОЗИТОРИЯ (структура всего проекта):",
-        repo_map,
-    ]
+def review_batch(targets, project, model, max_chars, description="", retries=2,
+                 think=True, max_tokens=4096, build_info=""):
+    base_parts = [project]
     if description.strip():
-        base += ["", "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):", description.strip()]
-    base = "\n".join(base) + "\n\nИЗМЕНЁННЫЕ ФАЙЛЫ ДЛЯ РЕВЬЮ:"
-
-    blocks = []
-    for t in targets:
-        lang = LANG_BY_EXT.get(Path(t["path"]).suffix.lower(), "?")
-        blocks.append(
-            f"\n--- {t['path']} (статус {t['status']}, язык {lang}) ---\n"
-            f"GIT DIFF:\n{t['diff'] or '(новый файл; см. полный текст ниже)'}\n"
-            f"ПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:\n{t['new_text'] or '(файл удалён)'}"
-        )
-
-    groups = []
-    cur = ""
-    for b in blocks:
-        candidate = cur + b
-        if cur and len(base) + len(candidate) > max_chars:
-            groups.append(cur)
-            cur = b
-        else:
-            cur = candidate
-    if cur:
-        groups.append(cur)
+        base_parts += ["", "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):", description.strip()]
+    if build_info.strip():
+        base_parts += ["", "СБОРКА ПРОЕКТА:", build_info.strip()]
+    base = "\n".join(base_parts) + "\n\nИЗМЕНЁННЫЕ ФАЙЛЫ ДЛЯ РЕВЬЮ:"
 
     tail = (
         "\n\nЗАДАЧА: найди реальные проблемы в изменениях перечисленных файлов "
@@ -501,22 +599,77 @@ def review_batch(targets, repo_map, model, max_chars, description="", retries=2)
         "Если проблем нет — верни {\"findings\": []}. Нумерация строк — по новому файлу."
     )
 
+    avail = max_chars - len(base) - len(tail) - 512
+    blocks = []
+    for t in targets:
+        lang = LANG_BY_EXT.get(Path(t["path"]).suffix.lower(), "?")
+        diff = t.get("diff") or "(новый файл; см. полный текст ниже)"
+        new_text = t.get("new_text") or "(файл удалён)"
+        is_new = t["status"] == "A" or not (t.get("diff") or "").strip()
+        ratio = 0.35 if is_new else 0.7
+        db = max(max(int(avail * ratio), 0), 0)
+        nb = max(avail - db, 0)
+        diff = clip_section(diff, db, f"diff файла {t['path']}")
+        new_text = clip_section(new_text, nb, f"полный текст файла {t['path']}")
+        blocks.append(
+            f"\n--- {t['path']} (статус {t['status']}, язык {lang}) ---\n"
+            f"GIT DIFF:\n{diff}\n"
+            f"ПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:\n{new_text}"
+        )
+
+    groups = []
+    cur = ""
+    for b in blocks:
+        candidate = cur + b
+        if cur and len(base) + len(candidate) + len(tail) > max_chars:
+            groups.append(cur)
+            cur = b
+        else:
+            cur = candidate
+    if cur:
+        groups.append(cur)
+
     all_findings = []
+    all_reasoning = []
     usage_tot = {}
     errors = []
     for gi, g in enumerate(groups):
         prompt = base + g + tail
         if len(prompt) > max_chars:
-            prompt = prompt[:max_chars] + "\n... [контекст усечён по лимиту]"
+            prompt = base + clip_section(g + tail, max_chars - len(base), "контент промпта")
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT + " В каждом замечании указывай поле file."},
             {"role": "user", "content": prompt},
         ]
-        print(f"[Система] batch-промпт {gi + 1}/{len(groups)} ({len(prompt)} симв.)")
+        save_prompt(prompt)
+        print(f"[Система] batch-промпт {gi + 1}/{len(groups)} ({len(prompt)} симв.)", flush=True)
         last_err = ""
         for attempt in range(retries + 1):
+            reason_started = False
+
+            def on_delta(kind, piece):
+                nonlocal reason_started
+                if kind == "reasoning":
+                    if not reason_started:
+                        print("\n[размышления агента] ", end="", flush=True)
+                        reason_started = True
+                    print(piece, end="", flush=True)
+                else:
+                    if reason_started:
+                        print("\n[ответ агента] ", end="", flush=True)
+                        reason_started = False
+                    print(piece, end="", flush=True)
+
             try:
-                content, usage = chat(messages, model)
+                content, reasoning, usage = chat(
+                    messages, model, think=think, max_tokens=max_tokens, on_delta=on_delta)
+                if not content.strip() and reasoning.strip():
+                    print("\n[Система] reasoning съел бюджет токенов — повторяю без размышлений",
+                          flush=True)
+                    content, _, usage = chat(
+                        messages, model, think=False, max_tokens=max_tokens, on_delta=None)
+                print(flush=True)
+                all_reasoning.append(reasoning)
                 data = extract_json(content)
                 findings = data.get("findings", [])
                 if not isinstance(findings, list):
@@ -533,37 +686,24 @@ def review_batch(targets, repo_map, model, max_chars, description="", retries=2)
                 })
         else:
             errors.append(f"промпт {gi + 1}: {last_err}")
-    return all_findings, usage_tot, "; ".join(errors)
+    return all_findings, usage_tot, "; ".join(errors), "\n\n".join(all_reasoning)
 
 
-def build_user_prompt(target, repo_map, related, max_chars, description=""):
-    parts = [
-        f"ФАЙЛ: {target['path']} (статус {target['status']}, язык "
-        f"{LANG_BY_EXT.get(Path(target['path']).suffix.lower(), '?')})",
+def build_user_prompt(target, project, related, max_chars, description="", build_info=""):
+    path = target["path"]
+    lang = LANG_BY_EXT.get(Path(path).suffix.lower(), "?")
+    fixed_parts = [
+        project,
         "",
-        "КАРТА РЕПОЗИТОРИЯ (структура всего проекта):",
-        repo_map,
+        f"ФАЙЛ: {path} (статус {target['status']}, язык {lang})",
     ]
     if description.strip():
-        parts += [
-            "",
-            "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):",
-            description.strip(),
-        ]
-    parts += [
-        "",
-        "GIT DIFF:",
-        target["diff"] or "(нет текстового diff, новый файл)",
-        "",
-        "ПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:",
-        target["new_text"] or "(файл удалён)",
-    ]
-    if related:
-        parts.append("")
-        parts.append("СВЯЗАННЫЕ ФАЙЛЫ (контекст, НЕ рецензируй их отдельно):")
-        for rel, body in related:
-            parts.append(f"--- {rel} ---\n{body}")
-    parts += [
+        fixed_parts += ["", "ОПИСАНИЕ ИЗМЕНЕНИЙ (что планировалось сделать):", description.strip()]
+    if build_info.strip():
+        fixed_parts += ["", "СБОРКА ПРОЕКТА:", build_info.strip()]
+    head = "\n".join(fixed_parts)
+
+    tail = "\n".join([
         "",
         "ЗАДАЧА: найди реальные проблемы именно в изменениях этого файла "
         "(баги, ошибки логики, null/типизация, безопасность, async, "
@@ -584,35 +724,81 @@ def build_user_prompt(target, repo_map, related, max_chars, description=""):
         "  ]",
         "}",
         "Если проблем нет — верни {\"findings\": []}. Нумерация строк — по новому файлу.",
-    ]
-    text = "\n".join(parts)
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n... [контекст усечён по лимиту]"
-    return text
+    ])
+
+    diff = target["diff"] or "(нет текстового diff, новый файл)"
+    new_text = target["new_text"] if target["new_text"] else "(файл удалён)"
+    is_new_file = target["status"] == "A" or not (target["diff"] or "").strip()
+
+    avail = max_chars - len(head) - len(tail) - 256
+    diff_budget = max(int(avail * (0.35 if is_new_file else 0.65)), 0)
+    new_budget = max(avail - diff_budget, 0)
+    diff = clip_section(diff, diff_budget, f"diff файла {path}")
+    new_text = clip_section(new_text, new_budget, f"полный текст файла {path}")
+
+    body = "\n\nGIT DIFF:\n" + diff + "\n\nПОЛНЫЙ ТЕКСТ НОВОГО ФАЙЛА:\n" + new_text
+
+    related_budget = max_chars - len(head) - len(tail) - len(body)
+    rel_parts = []
+    if related and related_budget > 300:
+        rel_lines = ["", "СВЯЗАННЫЕ ФАЙЛЫ (контекст, НЕ рецензируй их отдельно):"]
+        for rel, body_txt in related:
+            rel_lines.append(f"--- {rel} ---\n{body_txt}")
+        rel_text = "\n".join(rel_lines)
+        if len(rel_text) + len(head) + len(tail) + len(body) <= max_chars:
+            rel_parts = [rel_text]
+        else:
+            rel_parts = [clip_section(rel_text, related_budget, "связанные файлы")]
+
+    return head + body + "\n".join(rel_parts) + "\n" + tail
 
 
-def review_file(target, repo_map, related, model, max_chars, retries=2, description=""):
-    user = build_user_prompt(target, repo_map, related, max_chars, description)
+def review_file(target, project, related, model, max_chars, retries=2, description="",
+                build_info="", think=True, max_tokens=4096):
+    user = build_user_prompt(target, project, related, max_chars, description, build_info)
+    save_prompt(user)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
     last_err = ""
     for attempt in range(retries + 1):
+        reason_started = False
+
+        def on_delta(kind, piece):
+            nonlocal reason_started
+            if kind == "reasoning":
+                if not reason_started:
+                    print("\n[размышления агента] ", end="", flush=True)
+                    reason_started = True
+                print(piece, end="", flush=True)
+            else:
+                if reason_started:
+                    print("\n[ответ агента] ", end="", flush=True)
+                    reason_started = False
+                print(piece, end="", flush=True)
+
         try:
-            content, usage = chat(messages, model)
+            content, reasoning, usage = chat(
+                messages, model, think=think, max_tokens=max_tokens, on_delta=on_delta)
+            if not content.strip() and reasoning.strip():
+                print("\n[Система] reasoning съел бюджет токенов — повторяю без размышлений",
+                      flush=True)
+                content, _, usage = chat(
+                    messages, model, think=False, max_tokens=max_tokens, on_delta=None)
+            print(flush=True)
             data = extract_json(content)
             findings = data.get("findings", [])
             if not isinstance(findings, list):
                 raise ValueError('поле "findings" не массив')
-            return findings, usage, ""
+            return findings, usage, "", reasoning
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             messages.append({
                 "role": "user",
                 "content": f"Ответ не распарсился ({last_err}). Верни ТОЛЬКО валидный JSON по схеме.",
             })
-    return [], {}, last_err
+    return [], {}, last_err, ""
 
 
 def severity_badge(sev):
@@ -646,6 +832,19 @@ def write_report(path, data):
     lines.append("```")
     lines.append(data["mech"])
     lines.append("```\n")
+
+    if data.get("build") and data["build"].get("cmd"):
+        build = data["build"]
+        lines.append("## Сборка проекта\n")
+        lines.append(f"- Тип: {build.get('kind', '')}")
+        lines.append(f"- Команда: `{build['cmd']}`")
+        lines.append(f"- Статус: {'OK' if build.get('ok') else 'ПРОВАЛ'} "
+                     f"({build.get('duration', 0):.1f} c)")
+        if build.get("output"):
+            lines.append("\n<details>\n<summary>Вывод</summary>\n\n```")
+            lines.append(build["output"][:8000])
+            lines.append("```\n</details>\n")
+        lines.append("")
 
     lines.append("## Сводка по серьёзности\n")
     if data["severity_counts"]:
@@ -687,6 +886,19 @@ def write_report(path, data):
             lines.append(f"- `{e['file']}`: {e['error']}")
         lines.append("")
 
+    if data.get("reasoning"):
+        lines.append("## Рассуждения агента (reasoning)\n")
+        for rel, text in sorted(data["reasoning"].items()):
+            text = (text or "").strip()
+            if not text:
+                continue
+            if len(text) > 4000:
+                text = text[:4000] + "\n... [усечено]"
+            lines.append(f"### `{rel}`\n")
+            lines.append("```")
+            lines.append(text)
+            lines.append("```\n")
+
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -699,15 +911,22 @@ def main():
     ap.add_argument("--model", help="id модели в LM Studio (по умолчанию автодетект)")
     ap.add_argument("--max-context-chars", type=int, default=24000,
                     help="бюджет контекста на один файл (символы)")
-    ap.add_argument("--max-tokens", type=int, default=1800, help="максимум токенов ответа")
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="максимум токенов ответа (учтите, что reasoning их тратит)")
     ap.add_argument("--out", help="путь к файлу отчёта (по умолчанию reviews/ рядом со скриптом)")
     ap.add_argument("--description", help="текстовое описание того, что сделано в изменениях")
     ap.add_argument("--description-file", help="файл с описанием изменений (UTF-8)")
     ap.add_argument("--batch", action="store_true",
                     help="проверять все изменённые файлы одним промптом")
+    ap.add_argument("--no-compile", action="store_true", help="не компилировать проект")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="отключить reasoning (enable_thinking) в запросах к модели")
     ap.add_argument("--no-llm", action="store_true", help="только git+контекст, без модели")
     ap.add_argument("--list", action="store_true", help="показать изменённые файлы и выйти")
+    ap.add_argument("--prompt-file", help="файл, в который записывается отправляемый промпт (UTF-8)")
     args = ap.parse_args()
+    global PROMPT_FILE_PATH
+    PROMPT_FILE_PATH = args.prompt_file
 
     repo = Path(args.repo).resolve()
     if not repo.is_dir():
@@ -742,7 +961,7 @@ def main():
     print(f"[Система] Файлов к ревью: {len(targets)}")
 
     index = collect_index(repo)
-    repo_map = build_repo_map(index)
+    project = build_project_header(repo, targets)
     mech = mechanical_checks(repo, diff_args if diff_args != ["HEAD~1...HEAD"] else ["HEAD~1", "HEAD"])
     cache = {}
 
@@ -755,17 +974,30 @@ def main():
     if args.description:
         description = args.description
 
+    build = None
+    if not args.no_compile and not getattr(args, "list", False):
+        print("[Система] Компилирую проект...")
+        build = compile_project(repo, targets)
+        status = "OK" if build.get("ok") else "ПРОВАЛ"
+        print(f"[Сборка] {build.get('kind')} ({build.get('duration', 0):.1f} c) -> {status}")
+        if not build.get("ok"):
+            print(f"[Сборка] {build.get('output', '')[:1200]}")
+    build_text = build_info_text(build)
+
     by_file = {}
     rejected = []
     errors = []
     severity_counts = {}
+    reasoning_map = {}
     tokens_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     started = time.time()
 
     if args.batch and not args.no_llm:
         print("[Система] Режим batch: все изменённые файлы — одним промптом.")
-        findings, batch_usage, err = review_batch(
-            targets, repo_map, model, args.max_context_chars, description)
+        findings, batch_usage, err, reasoning = review_batch(
+            targets, project, model, args.max_context_chars, description,
+            think=not args.no_thinking, max_tokens=args.max_tokens, build_info=build_text)
+        reasoning_map["(batch)"] = reasoning
         for k in tokens_total:
             tokens_total[k] += int(batch_usage.get(k, 0) or 0)
         if err:
@@ -788,9 +1020,11 @@ def main():
                 by_file[t["path"]] = []
                 print(f"    diff={len(t['diff'])} симв., связанных файлов={len(related)}")
                 continue
-            findings, usage, err = review_file(t, repo_map, related, model,
-                                               args.max_context_chars,
-                                               description=description)
+            findings, usage, err, reasoning = review_file(
+                t, project, related, model, args.max_context_chars,
+                description=description, build_info=build_text,
+                think=not args.no_thinking, max_tokens=args.max_tokens)
+            reasoning_map[t["path"]] = reasoning
             for k in tokens_total:
                 tokens_total[k] += int(usage.get(k, 0) or 0)
             if err:
@@ -827,6 +1061,7 @@ def main():
         "tokens": {k: v for k, v in tokens_total.items() if v} or None,
         "mech": mech, "severity_counts": severity_counts,
         "by_file": by_file, "rejected": rejected, "errors": errors,
+        "build": build, "reasoning": reasoning_map,
     })
 
     print(f"\n[Система] Готово за {duration:.1f} с.")

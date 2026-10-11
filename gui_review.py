@@ -35,6 +35,45 @@ LM_STUDIO_BASE = os.environ.get("LM_STUDIO_URL", "http://localhost:1234/v1")
 
 AUTO_MODEL_LABEL = "(автоопределение)"
 
+CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / "LocalCodeReview"
+CONFIG_FILE = CONFIG_DIR / "gui_state.json"
+
+
+def save_state(app):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "folder": app.folder_var.get(),
+            "model": app.model_var.get(),
+            "open_npp": app.open_npp_var.get(),
+            "batch": app.batch_var.get(),
+            "compile": app.compile_var.get(),
+            "thinking": app.thinking_var.get(),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG_FILE)
+    except OSError:
+        pass
+
+
+def load_state(app):
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    folder = str(data.get("folder", "")).strip().strip('"')
+    if folder and os.path.isdir(folder):
+        app.folder_var.set(os.path.normpath(folder))
+    model = str(data.get("model", ""))
+    if model and model in app.model_combo.cget("values"):
+        app.model_var.set(model)
+    for var, key in ((app.open_npp_var, "open_npp"),
+                     (app.batch_var, "batch"),
+                     (app.compile_var, "compile"),
+                     (app.thinking_var, "thinking")):
+        if isinstance(data.get(key), bool):
+            var.set(data[key])
+
 
 def find_notepadpp():
     candidates = [
@@ -58,15 +97,18 @@ class ReviewApp(tk.Tk):
         self.proc = None
         self.out_path = None
         self.desc_file = None
+        self.prompt_file = None
         self.q = queue.Queue()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        load_state(self)
         threading.Thread(target=self._fetch_models, daemon=True).start()
 
     def _build_ui(self):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
-        root.columnconfigure(0, weight=1)
+        root.columnconfigure(0, weight=3)
+        root.columnconfigure(1, weight=2)
         root.rowconfigure(3, weight=1)
         root.rowconfigure(5, weight=2)
 
@@ -98,9 +140,17 @@ class ReviewApp(tk.Tk):
         ttk.Checkbutton(opts, text="Открыть отчёт в Notepad++ по завершении",
                         variable=self.open_npp_var).grid(row=0, column=2, sticky="e")
         self.batch_var = tk.BooleanVar(value=False)
+        self.compile_var = tk.BooleanVar(value=True)
+        self.thinking_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Все файлы одним промптом (batch)",
                         variable=self.batch_var).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(opts, text="Компилировать проект",
+                        variable=self.compile_var).grid(
+            row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(opts, text="Reasoning (thinking)",
+                        variable=self.thinking_var).grid(
+            row=1, column=2, sticky="e", pady=(6, 0))
 
         btns = ttk.Frame(root)
         btns.grid(row=5, column=0, sticky="new")
@@ -121,6 +171,20 @@ class ReviewApp(tk.Tk):
         sb.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=sb.set)
 
+        prompt_frame = ttk.LabelFrame(root, text="Промпт (отправляется в модель)",
+                                      padding=4)
+        prompt_frame.grid(row=0, column=1, rowspan=7, sticky="nsew", padx=(12, 0))
+        prompt_frame.columnconfigure(0, weight=1)
+        prompt_frame.rowconfigure(0, weight=1)
+        self.prompt_text = tk.Text(prompt_frame, state="disabled", wrap="none",
+                                   font=("Consolas", 9))
+        self.prompt_text.grid(row=0, column=0, sticky="nsew")
+        psb = ttk.Scrollbar(prompt_frame, command=self.prompt_text.yview)
+        psb.grid(row=0, column=1, sticky="ns")
+        self.prompt_text.configure(yscrollcommand=psb.set)
+        self.prompt_text.insert("1.0", "Промпт появится после запуска ревью.")
+        self._prompt_last = None
+
         ttk.Label(root, text="Совет: запускайте через pythonw gui_review.py, чтобы не было консоли.",
                   foreground="#777").grid(row=6, column=0, sticky="w", pady=(6, 0))
 
@@ -129,6 +193,7 @@ class ReviewApp(tk.Tk):
         chosen = filedialog.askdirectory(initialdir=initial, title="Выберите папку проекта")
         if chosen:
             self.folder_var.set(os.path.normpath(chosen))
+            save_state(self)
 
     def _fetch_models(self):
         try:
@@ -166,6 +231,7 @@ class ReviewApp(tk.Tk):
         if not AGENT.is_file():
             messagebox.showerror("Ошибка", f"Не найден {AGENT}")
             return
+        save_state(self)
 
         description = self.desc_text.get("1.0", "end").strip()
         self.desc_file = None
@@ -179,7 +245,15 @@ class ReviewApp(tk.Tk):
         reviews_dir.mkdir(parents=True, exist_ok=True)
         self.out_path = reviews_dir / f"code_review_{stamp}.md"
 
+        fd, self.prompt_file = tempfile.mkstemp(suffix=".txt", prefix="review_prompt_")
+        os.close(fd)
+        self._prompt_last = None
+        self.prompt_text.configure(state="normal")
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.configure(state="disabled")
+
         cmd = [sys.executable, str(AGENT), folder, "--out", str(self.out_path)]
+        cmd += ["--prompt-file", self.prompt_file]
         model = self.model_var.get().strip()
         if model and model != AUTO_MODEL_LABEL:
             cmd += ["--model", model]
@@ -187,6 +261,10 @@ class ReviewApp(tk.Tk):
             cmd += ["--description-file", self.desc_file]
         if self.batch_var.get():
             cmd += ["--batch"]
+        if not self.compile_var.get():
+            cmd += ["--no-compile"]
+        if not self.thinking_var.get():
+            cmd += ["--no-thinking"]
 
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
@@ -215,6 +293,23 @@ class ReviewApp(tk.Tk):
                 code = -1
             self.q.put(("done", code))
 
+    def _refresh_prompt(self):
+        if not self.prompt_file or not os.path.isfile(self.prompt_file):
+            return
+        try:
+            with open(self.prompt_file, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return
+        if text == self._prompt_last:
+            return
+        self._prompt_last = text
+        self.prompt_text.configure(state="normal")
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", text)
+        self.prompt_text.see("1.0")
+        self.prompt_text.configure(state="disabled")
+
     def _pump(self):
         try:
             while True:
@@ -226,17 +321,25 @@ class ReviewApp(tk.Tk):
                     return
         except queue.Empty:
             pass
+        self._refresh_prompt()
         if self.proc is not None and self.proc.poll() is None:
             self.after(100, self._pump)
 
     def _finish(self, code):
         self._set_running(False)
+        self._refresh_prompt()
         if self.desc_file and os.path.isfile(self.desc_file):
             try:
                 os.remove(self.desc_file)
             except OSError:
                 pass
             self.desc_file = None
+        if self.prompt_file and os.path.isfile(self.prompt_file):
+            try:
+                os.remove(self.prompt_file)
+            except OSError:
+                pass
+            self.prompt_file = None
 
         if code == 0 and self.out_path and self.out_path.is_file():
             self.status_var.set(f"Готово: {self.out_path.name}")
@@ -275,6 +378,7 @@ class ReviewApp(tk.Tk):
                 pass
 
     def _on_close(self):
+        save_state(self)
         if self.proc is not None and self.proc.poll() is None:
             if not messagebox.askyesno("Выход", "Ревью ещё выполняется. Прервать и выйти?"):
                 return
@@ -285,6 +389,11 @@ class ReviewApp(tk.Tk):
         if self.desc_file and os.path.isfile(self.desc_file):
             try:
                 os.remove(self.desc_file)
+            except OSError:
+                pass
+        if self.prompt_file and os.path.isfile(self.prompt_file):
+            try:
+                os.remove(self.prompt_file)
             except OSError:
                 pass
         self.destroy()
