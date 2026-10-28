@@ -3,7 +3,7 @@
 Простое оконное приложение для локального код-ревью (обёртка над agent_system.py).
 
 Поля:
-  - Папка проекта (git-репозиторий);
+  - Папка проекта (git-репозиторий) ЛИБО файл проекта/солюшена (.sln/.slnx/.csproj…);
   - Многострочное описание того, что сделано в изменениях;
   - Модель LM Studio (по умолчанию автоопределение).
 
@@ -44,6 +44,7 @@ def save_state(app):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({
+            "folder": app.folder_var.get(),
             "project": app.proj_var.get(),
             "model": app.model_var.get(),
             "extra_open": bool(app.extra.winfo_manager()),
@@ -63,8 +64,16 @@ def load_state(app):
     except (OSError, ValueError):
         return
     proj = str(data.get("project", "")).strip().strip('"')
-    if proj and os.path.isfile(proj):
-        app.proj_var.set(os.path.normpath(proj))
+    folder = str(data.get("folder", "")).strip().strip('"')
+    # восстанавливаем только одно (папка/проект взаимоисключающие), проект в приоритете
+    app._syncing = True
+    try:
+        if proj and os.path.isfile(proj):
+            app.proj_var.set(os.path.normpath(proj))
+        elif folder and os.path.isdir(folder):
+            app.folder_var.set(os.path.normpath(folder))
+    finally:
+        app._syncing = False
     model = str(data.get("model", ""))
     if model and model in app.model_combo.cget("values"):
         app.model_var.set(model)
@@ -102,6 +111,7 @@ class ReviewApp(tk.Tk):
         self.desc_file = None
         self.prompt_file = None
         self.q = queue.Queue()
+        self._syncing = False
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         load_state(self)
@@ -116,8 +126,8 @@ class ReviewApp(tk.Tk):
 
         left = ttk.Frame(pw, padding=(0, 0, 12, 0))
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(3, weight=1)
-        left.rowconfigure(5, weight=2)
+        left.rowconfigure(5, weight=1)
+        left.rowconfigure(7, weight=2)
         pw.add(left, weight=3)
 
         right = ttk.Frame(pw)
@@ -125,10 +135,21 @@ class ReviewApp(tk.Tk):
         right.rowconfigure(0, weight=1)
         pw.add(right, weight=2)
 
-        ttk.Label(left, text="Проект или солюшен (.sln/.slnx/.csproj):").grid(
+        ttk.Label(left, text="Папка проекта (git-репозиторий):").grid(
             row=0, column=0, sticky="w")
+        folder_row = ttk.Frame(left)
+        folder_row.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        folder_row.columnconfigure(0, weight=1)
+        self.folder_var = tk.StringVar()
+        ttk.Entry(folder_row, textvariable=self.folder_var).grid(
+            row=0, column=0, sticky="ew")
+        ttk.Button(folder_row, text="Обзор…", command=self._browse_folder).grid(
+            row=0, column=1, padx=(6, 0))
+
+        ttk.Label(left, text="Проект или солюшен (.sln/.slnx/.csproj):").grid(
+            row=2, column=0, sticky="w")
         proj_row = ttk.Frame(left)
-        proj_row.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        proj_row.grid(row=3, column=0, sticky="ew", pady=(2, 8))
         proj_row.columnconfigure(0, weight=1)
         self.proj_var = tk.StringVar()
         ttk.Entry(proj_row, textvariable=self.proj_var).grid(
@@ -136,13 +157,18 @@ class ReviewApp(tk.Tk):
         ttk.Button(proj_row, text="Обзор…", command=self._browse).grid(
             row=0, column=1, padx=(6, 0))
 
+        # папка и проект/солюшен взаимоисключающие
+        self.folder_var.trace_add("write", self._on_folder_changed)
+        self.proj_var.trace_add("write", self._on_proj_changed)
+
         ttk.Label(left, text="Что сделано в этих изменениях (описание):").grid(
-            row=2, column=0, sticky="nw")
+            row=4, column=0, sticky="nw")
         self.desc_text = tk.Text(left, height=6, wrap="word", undo=True)
-        self.desc_text.grid(row=3, column=0, sticky="nsew", pady=(2, 8))
+        self.desc_text.grid(row=5, column=0, sticky="nsew", pady=(2, 8))
+        self._setup_text_widget(self.desc_text)
 
         opts = ttk.Frame(left)
-        opts.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        opts.grid(row=6, column=0, sticky="ew", pady=(0, 8))
         opts.columnconfigure(1, weight=1)
         ttk.Label(opts, text="Модель:").grid(row=0, column=0, sticky="w")
         self.model_var = tk.StringVar(value=AUTO_MODEL_LABEL)
@@ -178,7 +204,7 @@ class ReviewApp(tk.Tk):
             row=1, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
 
         btns = ttk.Frame(left)
-        btns.grid(row=5, column=0, sticky="new")
+        btns.grid(row=7, column=0, sticky="new")
         self.run_btn = ttk.Button(btns, text="Запуск", command=self._run)
         self.run_btn.pack(side="left")
         self.stop_btn = ttk.Button(btns, text="Стоп", command=self._stop, state="disabled")
@@ -187,7 +213,7 @@ class ReviewApp(tk.Tk):
         ttk.Label(btns, textvariable=self.status_var).pack(side="left", padx=(12, 0))
 
         log_frame = ttk.LabelFrame(left, text="Журнал", padding=4)
-        log_frame.grid(row=5, column=0, sticky="nsew", pady=(40, 0))
+        log_frame.grid(row=7, column=0, sticky="nsew", pady=(40, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log = tk.Text(log_frame, state="disabled", wrap="word", height=10)
@@ -215,8 +241,94 @@ class ReviewApp(tk.Tk):
         self.prompt_text.insert("1.0", "Промпт появится после запуска ревью.")
         self._prompt_last = None
 
+    def _on_folder_changed(self, *_):
+        if self._syncing or not self.folder_var.get().strip():
+            return
+        self._syncing = True
+        self.proj_var.set("")
+        self._syncing = False
+
+    def _on_proj_changed(self, *_):
+        if self._syncing or not self.proj_var.get().strip():
+            return
+        self._syncing = True
+        self.folder_var.set("")
+        self._syncing = False
+
+    def _setup_text_widget(self, widget):
+        """Вставка/копирование: контекстное меню и Ctrl+<буква> при любой раскладке."""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Вырезать",
+                         command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать",
+                         command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: self._paste_into(widget))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё",
+                         command=lambda: self._select_all(widget))
+
+        def popup(event):
+            widget.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", popup)
+        widget.bind("<Control-KeyPress>", lambda e: self._text_ctrl(widget, e))
+        widget.bind("<Shift-Insert>", lambda e: self._paste_into(widget))
+        widget.bind("<Control-Insert>", lambda e: widget.event_generate("<<Copy>>"))
+
+    def _select_all(self, widget):
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "1.0")
+        widget.see("insert")
+
+    def _paste_into(self, widget):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if str(widget.cget("state")) == "disabled":
+            return "break"
+        try:
+            widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        widget.insert("insert", text)
+        widget.see("insert")
+        return "break"
+
+    def _text_ctrl(self, widget, event):
+        if not (event.state & 0x4):  # Control не нажат
+            return None
+        # keycode не зависит от раскладки (V=86, C=67, X=88, A=65)
+        code = event.keycode
+        if code == 86:
+            return self._paste_into(widget)
+        if code == 67:
+            widget.event_generate("<<Copy>>")
+            return "break"
+        if code == 88:
+            if str(widget.cget("state")) != "disabled":
+                widget.event_generate("<<Cut>>")
+            return "break"
+        if code == 65:
+            self._select_all(widget)
+            return "break"
+        return None
+
+    def _browse_folder(self):
+        initial = self.folder_var.get() or str(Path.home())
+        chosen = filedialog.askdirectory(initialdir=initial,
+                                         title="Выберите папку проекта (git-репозиторий)")
+        if chosen:
+            self.folder_var.set(os.path.normpath(chosen))
+            save_state(self)
+
     def _browse(self):
-        initial = os.path.dirname(self.proj_var.get()) or str(Path.home())
+        initial = os.path.dirname(self.proj_var.get()) or self.folder_var.get() \
+            or str(Path.home())
         chosen = filedialog.askopenfilename(
             initialdir=initial, title="Выберите проект или солюшен",
             filetypes=[("Проекты/солюшены",
@@ -264,11 +376,23 @@ class ReviewApp(tk.Tk):
         if self.proc is not None and self.proc.poll() is None:
             return
         proj = self.proj_var.get().strip().strip('"')
-        if not proj or not os.path.isfile(proj):
+        folder = self.folder_var.get().strip().strip('"')
+        if proj and folder:
             messagebox.showerror("Ошибка",
-                                 "Укажите файл проекта/солюшена (.sln/.slnx/.csproj…).")
+                                 "Выберите что-то одно: папку ИЛИ проект/солюшен.")
             return
-        target = os.path.normpath(proj)
+        if proj and os.path.isfile(proj):
+            target = os.path.normpath(proj)
+        elif folder and os.path.isdir(folder):
+            target = os.path.normpath(folder)
+        elif proj:
+            messagebox.showerror("Ошибка", f"Файл проекта/солюшена не найден:\n{proj}")
+            return
+        else:
+            messagebox.showerror("Ошибка",
+                                 "Укажите папку проекта (git-репозиторий) "
+                                 "или файл проекта/солюшена.")
+            return
         if not AGENT.is_file():
             messagebox.showerror("Ошибка", f"Не найден {AGENT}")
             return
